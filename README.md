@@ -11,3 +11,5 @@ docker push
 kubectl apply -f ./deploy-dev/01_namespace.yaml
 ...
 ```
+# Credits
+https://github.com/furiousteabag/vram-calculator/tree/main
