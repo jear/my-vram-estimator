@@ -15,3 +15,5 @@ kubectl apply -f 03_
 kubectl apply -f 04_
 kubectl apply -f 05_
 ```
+# Credits
+https://github.com/furiousteabag/vram-calculator/
