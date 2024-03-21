@@ -1,2 +1,0 @@
-# my-vram-estimator
-
