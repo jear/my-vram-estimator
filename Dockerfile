@@ -1,6 +1,6 @@
 # the lazy version
-#FROM nginx:alpine
-#COPY . /usr/share/nginx/html
+FROM nginx:alpine
+COPY . /usr/share/nginx/html
 
 # Multi-stage build example
 #FROM node:14
