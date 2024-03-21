@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+    <title>Breaking down GPU VRAM consumption</title>
+    <style>
+      body {
+        font-family: monospace;
+        font-size: 16px;
+        max-width: 650px;
+        margin: 50px auto;
+        padding: 0 10px;
+      }
+      img {
+        max-width: 100%;
+        height: auto;
+        display: block;
+        margin-left: auto;
+        margin-right: auto;
+      }
+      a {
+        color: rgb(0, 0, 238);
+        text-decoration: none;
+      }
+      details {
+        cursor: pointer;
+      }
+      pre {
+        overflow-x: auto;
+        max-width: 100%;
+        border: 1px solid #ccc;
+        padding: 5px;
+        background-color: #f8f8f8;
+      }
+      code {
+        background-color: #f8f8f8;
+      }
+      table,
+      th,
+      td {
+        border: 2px solid gray;
+        border-collapse: collapse;
+      }
+    </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  </head>
+  <body>
+    <h1>Breaking down GPU VRAM consumption</h1>
+        <i>26 Dec 2023</i>
+        <div id="toc"><ul>
+<li><a href="#prerequisites-for-experiments" id="toc-prerequisites-for-experiments">Prerequisites for
+experiments</a></li>
+<li><a href="#mixed-precision-training" id="toc-mixed-precision-training">Mixed precision training</a></li>
+<li><a href="#handling-multi-gpu-scenarios" id="toc-handling-multi-gpu-scenarios">Handling multi-GPU
+scenarios</a></li>
+<li><a href="#breaking-down-the-components" id="toc-breaking-down-the-components">Breaking down the components</a>
+<ul>
+<li><a href="#cuda-kernels" id="toc-cuda-kernels">CUDA Kernels</a></li>
+<li><a href="#parameters" id="toc-parameters">Parameters</a></li>
+<li><a href="#activations" id="toc-activations">Activations</a></li>
+<li><a href="#gradients" id="toc-gradients">Gradients</a></li>
+<li><a href="#optimizer-states" id="toc-optimizer-states">Optimizer
+states</a></li>
+<li><a href="#outputs" id="toc-outputs">Outputs</a></li>
+</ul></li>
+<li><a href="#problems" id="toc-problems">Problems</a></li>
+<li><a href="#acknowledgements" id="toc-acknowledgements">Acknowledgements</a></li>
+</ul></div>
+    <hr>
+    <p><strong>Highlight</strong>: Check out my <a href="https://vram.asmirnov.xyz/" target="_blank">GPU VRAM
+    Calculator</a></p>
+    <p><strong>Highlight</strong>: Check out <a href="https://news.ycombinator.com/item?id=38774026" target="_blank">HN discussion</a></p>
+    <p>I’ve always been curious about the GPU VRAM required for training
+    and fine-tuning transformer-based language models. What factors
+    influence VRAM consumption? How does it vary with different model
+    settings? I dug into the topic and conducted my own
+    measurements.</p>
+    <p>Other great resources on this topic include <a href="https://github.com/stas00/ml-engineering/blob/master/performance/software.md#anatomy-of-models-memory-usage" target="_blank">Stas Bekman’s section</a> from his ML Engineering
+    book, the core inspiration for <a href="https://huggingface.co/docs/transformers/main/en/model_memory_anatomy#anatomy-of-models-memory" target="_blank">Hugging Face’s model memory anatomy article</a>.
+    Also, check out <a href="https://blog.eleuther.ai/transformer-math/#memory-requirements" target="_blank">Eleuther’s blog</a> which also covers compute
+    costs.</p>
+    <p>Quick note: This post doesn’t delve into the memory usage of
+    quantized models and PEFT fine-tuning techniques like LoRA or
+    QLoRA.</p>
+    <h2 id="prerequisites-for-experiments"><a href="#prerequisites-for-experiments" style="text-decoration: none; color: inherit;">Prerequisites for
+    experiments</a></h2>
+    <p>When we talk about RAM, we often use GB (10**9 bytes) and GiB
+    (2**30 bytes) interchangeably. But in reality, we’re dealing with
+    GiB. Take the Nvidia 3090’s “24 GB VRAM” – it’s actually 24 GiB, or
+    about 25.76 GB. To keep things clear, I’ll stick with MiB and
+    GiB.</p>
+    <p>To measure VRAM usage accurately, we need to delete the variable,
+    run garbage collection, clear the CUDA cache, and then measure the
+    VRAM difference. Here’s an example:</p>
+    <div class="sourceCode" id="cb1"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> torch.Tensor(<span class="dv">4</span>, <span class="dv">8192</span>, <span class="dv">32000</span>).cuda()</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>total_vram <span class="op">=</span> get_vram()</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">del</span> x<span class="op">;</span> gc.collect()<span class="op">;</span> torch.cuda.empty_cache()</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>x_vram <span class="op">=</span> total_vram <span class="op">-</span> get_vram()</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 4000 MiB</span></span></code></pre></div>
+    <p>The <a href="https://github.com/stas00/ipyexperiments">ipyexperiments</a>
+    Python package automates this after each cell execution, which is
+    pretty convenient.</p>
+    <p>Before assessing memory usage, it’s important to perform warm-up
+    steps, essentially running the same code twice, to load CUDA kernels
+    that weren’t loaded during the initial setup. Also, we should
+    disable the <a href="https://huggingface.co/docs/transformers/main/en/model_doc/mistral#transformers.MistralConfig.use_cache" target="_blank">cache</a> in the decoder, which is used during
+    inference to prevent re-computation of hidden states <a href="#fn1" class="footnote-ref" id="fnref1" role="doc-noteref">[1]</a>.</p>
+    <h2 id="mixed-precision-training"><a href="#mixed-precision-training" style="text-decoration: none; color: inherit;">Mixed precision
+    training</a></h2>
+    <p>Understanding mixed precision training is key, as it’s commonly
+    used in pretraining and finetuning. Normally, model parameters are
+    stored in float32 format, taking up 4 bytes per parameter. Mixed
+    precision training uses float16, halving the calculation time and
+    reducing the size of activations.</p>
+    <p>But why “mixed”? The training isn’t entirely in half precision.
+    Lower precision can lead to imprecise weight updates or even
+    gradients turning to zero. So, in mixed precision training, the
+    master copy of the weights is kept and updated in fp32, and before
+    each forward pass, these weights are copied into fp16 format.</p>
+    <p>For a deeper dive into mixed precision, check out this <a href="https://docs.fast.ai/callback.fp16.html" target="_blank">fast.ai documentation</a>, which includes a detailed
+    illustration, and <a href="https://residentmario.github.io/pytorch-training-performance-guide/mixed-precision.html#" target="_blank">Aleksey Bilogur’s blog</a>, which offers practical
+    PyTorch code examples.</p>
+    <h2 id="handling-multi-gpu-scenarios"><a href="#handling-multi-gpu-scenarios" style="text-decoration: none; color: inherit;">Handling multi-GPU
+    scenarios</a></h2>
+    <p>What if a model doesn’t fit on a single GPU? There are two
+    scenarios:</p>
+    <ol type="1">
+    <li>Inference: Use model parallelism to distribute layers across
+    GPUs. This is done automatically in transformers with
+    <code>device_map="auto"</code>. Learn more in the <a href="https://huggingface.co/docs/accelerate/main/en/concept_guides/big_model_inference" target="_blank">accelerate docs</a>.</li>
+    <li>Training: Distribute layers, optimizer states, and gradients
+    across GPUs. Depending on your setup, you might use different <a href="https://www.microsoft.com/en-us/research/blog/zero-deepspeed-new-system-optimizations-enable-training-models-with-over-100-billion-parameters/" target="_blank">DeepSpeed ZeRO stages</a> or <a href="https://engineering.fb.com/2021/07/15/open-source/fsdp/" target="_blank">FSDP</a> <a href="#fn2" class="footnote-ref" id="fnref2" role="doc-noteref">[2]</a> for full sharding.
+    The more you shard, the slower training will be because of a
+    communication overhead. For a comparison of multi-GPU training
+    approaches, check out <a href="https://huggingface.co/docs/transformers/main/en/perf_train_gpu_many" target="_blank">Hugging Face’s documentation</a>.</li>
+    </ol>
+    <h2 id="breaking-down-the-components"><a href="#breaking-down-the-components" style="text-decoration: none; color: inherit;">Breaking down the
+    components</a></h2>
+    <p>Memory consumption consists of the following components:</p>
+    <center>
+    <table>
+    <thead>
+    <tr class="header">
+    <th style="text-align: center;"></th>
+    <th style="text-align: center;">Train</th>
+    <th style="text-align: center;">Inference</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr class="odd">
+    <td style="text-align: center;">CUDA Kernels</td>
+    <td style="text-align: center;">✅</td>
+    <td style="text-align: center;">✅</td>
+    </tr>
+    <tr class="even">
+    <td style="text-align: center;">Parameters</td>
+    <td style="text-align: center;">✅</td>
+    <td style="text-align: center;">✅</td>
+    </tr>
+    <tr class="odd">
+    <td style="text-align: center;">Activations</td>
+    <td style="text-align: center;">✅</td>
+    <td style="text-align: center;">✅</td>
+    </tr>
+    <tr class="even">
+    <td style="text-align: center;">Gradients</td>
+    <td style="text-align: center;">✅</td>
+    <td style="text-align: center;">❌</td>
+    </tr>
+    <tr class="odd">
+    <td style="text-align: center;">Optimizer States</td>
+    <td style="text-align: center;">✅</td>
+    <td style="text-align: center;">❌</td>
+    </tr>
+    <tr class="even">
+    <td style="text-align: center;">Outputs</td>
+    <td style="text-align: center;">✅</td>
+    <td style="text-align: center;">✅</td>
+    </tr>
+    </tbody>
+    </table>
+    </center>
+    <p>An interesting aspect of PyTorch is its approach to memory
+    allocation. Essentially, PyTorch rarely releases memory once it’s
+    been allocated. For instance, during the forward pass, activations
+    are calculated and stored in memory. Even after these activations
+    are no longer needed following the backward pass, the memory they
+    occupy isn’t released. This strategy is adopted to avoid the
+    overhead associated with frequent memory allocation calls <a href="#fn3" class="footnote-ref" id="fnref3" role="doc-noteref">[3]</a>.</p>
+    <h3 id="cuda-kernels"><a href="#cuda-kernels" style="text-decoration: none; color: inherit;">CUDA Kernels</a></h3>
+    <p>Upon first using the GPU, CUDA kernels will allocate between 300
+    MiB to 2000 MiB. This can vary based on GPU, driver, and PyTorch
+    versions. It could be measured by initializing any small tensor and
+    moving it to GPU:</p>
+    <div class="sourceCode" id="cb2"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> torch.ones(<span class="dv">1</span>).cuda()</span></code></pre></div>
+    <h3 id="parameters"><a href="#parameters" style="text-decoration: none; color: inherit;">Parameters</a></h3>
+    <p>When measuring the amount of memory that will be used by
+    parameters, it is important to understand the difference between
+    parameters and buffers. Parameters are the actual weights that are
+    being trained and updated by the optimizer. They could be retrieved
+    by calling <code>model.parameters()</code>. Apart from parameters
+    there exist fixed tensors, which are needed in some computations,
+    but which are not needed to be updated. These are called buffers and
+    may be retrieved by calling <code>model.buffers()</code>. One
+    example of buffers is precomputed positional encodings <a href="#fn4" class="footnote-ref" id="fnref4" role="doc-noteref">[4]</a>. So, in this section, under
+    ‘parameters’ I assume ‘parameters’ + ‘buffers’.</p>
+    <p>During inference, the memory needed for parameters is
+    straightforward — it’s just the number of parameters multiplied by
+    the number of bytes per parameter. You are specifying the number of
+    bytes per parameter when loading a model like
+    <code>.from_pretrained(..., torch_dtype=torch.float16)</code>. For
+    instance, a 7B-parameter model like Mistral, when loaded in
+    half-precision (float16), would take 7.51 × 10**9 × 2 bytes,
+    equating to 14324 MiB.</p>
+    <p>When training as usual, in full precision, 4 bytes per parameter
+    are occupied. Mixed precision training is more common though, in
+    this case, we have to maintain both half precision (for forward
+    pass, 2 bytes per param) and full precision model weights (for
+    applying updates to them, 4 bytes per param), so in total it takes 6
+    bytes per param.</p>
+    <h3 id="activations"><a href="#activations" style="text-decoration: none; color: inherit;">Activations</a></h3>
+    <p>‘Activations’ refer to the intermediate outputs essential for
+    backpropagation. They are usually the memory bottleneck in
+    transformer training, especially since their size scales
+    quadratically with sequence length (we have to store the output of a
+    <code>softmax(Q×K.T)</code> which has Batch Size × Number of
+    Attention Heads × Sequence Length ** 2 shape). There are good
+    estimations of activations size per layer in <a href="https://arxiv.org/abs/2205.05198" target="_blank">“Reducing
+    Activation Recomputation in Large Transformer Models”</a> paper in
+    section 4.1 although for each model activations will differ. For
+    example, in the mentioned paper they also count dropout masks
+    whereas newer architectures like <a href="https://github.com/facebookresearch/llama/blob/main/llama/model.py" target="_blank">Llama</a> don’t use dropout at all.</p>
+    <p>During training, we store all layer activations for backprop, but
+    in inference, we only keep the current (single) layer’s
+    activations.</p>
+    <p>We can reduce activations size on training in the cost of
+    training speed (slowdown around 20%) by discarding the activations
+    during the forward pass and recalculating them when needed during
+    the backward pass, this is called <a href="https://medium.com/tensorflow/fitting-larger-networks-into-memory-583e3c758ff9" target="_blank">gradient checkpointing</a>.</p>
+    <h3 id="gradients"><a href="#gradients" style="text-decoration: none; color: inherit;">Gradients</a></h3>
+    <p>Gradients are always stored in full precision taking 4 bytes per
+    parameter.</p>
+    <h3 id="optimizer-states"><a href="#optimizer-states" style="text-decoration: none; color: inherit;">Optimizer
+    states</a></h3>
+    <p>Optimizers like Adam and SGD have their own memory needs. SGD
+    with momentum and Adam both store a moving average of gradients for
+    each parameter in full precision. Additionally, Adam keeps a moving
+    average of squared gradients.</p>
+    <center>
+    <table>
+    <thead>
+    <tr class="header">
+    <th style="text-align: center;"></th>
+    <th style="text-align: center;">First Moments</th>
+    <th style="text-align: center;">Second Moments</th>
+    <th style="text-align: center;">Bytes per Param</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr class="odd">
+    <td style="text-align: center;">SGD</td>
+    <td style="text-align: center;">❌</td>
+    <td style="text-align: center;">❌</td>
+    <td style="text-align: center;">0</td>
+    </tr>
+    <tr class="even">
+    <td style="text-align: center;">SGD w momentum</td>
+    <td style="text-align: center;">✅</td>
+    <td style="text-align: center;">❌</td>
+    <td style="text-align: center;">4</td>
+    </tr>
+    <tr class="odd">
+    <td style="text-align: center;">ADAM</td>
+    <td style="text-align: center;">✅</td>
+    <td style="text-align: center;">✅</td>
+    <td style="text-align: center;">8</td>
+    </tr>
+    </tbody>
+    </table>
+    </center>
+    <h3 id="outputs"><a href="#outputs" style="text-decoration: none; color: inherit;">Outputs</a></h3>
+    <p>Finally, the output tensors (Batch Size × Sequence Length ×
+    Vocabulary Size) are almost always in float32. This remains true
+    even if the model was loaded in a lower precision because model
+    itself casts outputs to float32 most of the time <a href="#fn5" class="footnote-ref" id="fnref5" role="doc-noteref">[5]</a>
+    <a href="#fn6" class="footnote-ref" id="fnref6" role="doc-noteref">[6]</a>.</p>
+    <p>While training, we also need to store probabilities
+    <code>F.softmax(logits, dim=-1)</code> which are the same size as
+    the output tensor.</p>
+    <h2 id="problems"><a href="#problems" style="text-decoration: none; color: inherit;">Problems</a></h2>
+    <p>In my experiments with measuring VRAM usage <a href="https://github.com/furiousteabag/vram/blob/master/vram.ipynb" target="_blank">in the notebook</a>, I am facing some persistent
+    mismatch between what my experiments show and the calculated
+    figures, particularly regarding the size of activations during the
+    training’s forward pass. So there is still something to figure
+    out!</p>
+    <h2 id="acknowledgements"><a href="#acknowledgements" style="text-decoration: none; color: inherit;">Acknowledgements</a></h2>
+    <p>Thanks to <a href="https://stasosphere.com/machine-learning/" target="_blank">Stas Bekman</a> for helping me shape my
+    understanding and Quentin Anthony’s Python <a href="https://gist.github.com/Quentin-Anthony/f43939791a7ceb0b01a4937308317be5" target="_blank">gist for VRAM calculation</a>.</p>
+    <aside id="footnotes" class="footnotes footnotes-end-of-document" role="doc-endnotes">
+    <hr>
+    <ol>
+    <li id="fn1"><p><a href="https://discuss.huggingface.co/t/what-is-the-purpose-of-use-cache-in-decoder/958/2" target="_blank">What is the purpose of ‘use_cache’ in decoder?
+    (discuss.huggingface.co)</a> | <a href="#fnref1" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+    <li id="fn2"><p><a href="https://pytorch.org/blog/introducing-pytorch-fully-sharded-data-parallel-api/" target="_blank">Introducing PyTorch Fully Sharded Data Parallel
+    (FSDP) API (pytorch.org/blog)</a> | <a href="#fnref2" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+    <li id="fn3"><p><a href="https://discuss.pytorch.org/t/what-exactly-is-occupying-the-gpu-cache/80645/2" target="_blank">What exactly is occupying the GPU cache?
+    (discuss.pytorch.org)</a> | <a href="#fnref3" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+    <li id="fn4"><p><a href="https://discuss.pytorch.org/t/what-is-the-difference-between-register-buffer-and-register-parameter-of-nn-module/32723" target="_blank">What is the difference between
+    <code>register_buffer</code> and <code>register_parameter</code> of
+    <code>nn.Module</code> (discuss.pytorch.org)</a> | <a href="#fnref4" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+    <li id="fn5"><p><a href="https://github.com/facebookresearch/llama/blob/main/llama/model.py#L494" target="_blank">Llama 2 casts output tensor to float32
+    (github.com/facebookresearch/llama)</a> | <a href="#fnref5" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+    <li id="fn6"><p><a href="https://github.com/mistralai/mistral-src/blob/main/mistral/model.py#L304" target="_blank">Mistral casts output tensor to float32
+    (github.com/mistralai)</a> | <a href="#fnref6" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+    </ol>
+    </aside>
+    <hr>
+    <a href="https://asmirnov.xyz/">home</a>
+  
+
+</body></html>
