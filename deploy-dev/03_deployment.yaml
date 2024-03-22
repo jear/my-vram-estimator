@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: vram-calculation-dev
-          image: harbor.datasvc01.lysdemolab.fr/jear/vram-calculation:v0.2
+          image: harbor.datasvc01.lysdemolab.fr/jear/vram-calculation:v0.3-dev
           resources:
             requests: 
               cpu: "250m"
