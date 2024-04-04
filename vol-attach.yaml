@@ -1,0 +1,11 @@
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttachment
+metadata:
+  name: csi-1637ba1112c58df3ebd3e11889a77308e22546b7e4e9073cc7be27ff191142a0
+spec:
+  attacher: rook-ceph.rbd.csi.ceph.com
+  nodeName: worker3
+  source:
+    persistentVolumeName: pvc-ee70fa3b-1373-439b-93a4-c56125fc511e
+status:
+  attached: true

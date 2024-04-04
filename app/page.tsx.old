@@ -562,6 +562,23 @@ export default function App() {
 
         <Divider sx={{ height: "30px", width: "100%" }} />
 
+        <Typography variant="subtitle1" align="center">
+          While estimates might not be completely precise, they reflect my current understanding of the topic. For an
+          in-depth explanation and the logic behind these numbers, feel free to check out my{" "}
+          <Link href="https://asmirnov.xyz/vram" rel="noreferrer" target="_blank">
+            detailed post
+          </Link>{" "}
+          and the{" "}
+          <Link
+            href="https://github.com/furiousteabag/vram-calculator/blob/main/app/_lib/index.ts"
+            rel="noreferrer"
+            target="_blank"
+          >
+            calculation code
+          </Link>{" "}
+          in the source repo. If you feel something is wrong please reach out via email{" "}
+          <Link href="mailto:alex@asmirnov.xyz">alex@asmirnov.xyz</Link> or create an issue/PR in the repo. Cheers!
+        </Typography>
       </Grid>
     </Container>
   )
