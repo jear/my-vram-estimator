@@ -4,7 +4,7 @@ npm install
 npm run dev
 npm run build
 
-# Copy Dockerfile in ./out
+# Build Dockerfile with ./out content
 docker build -t harbor.datasvc01.lysdemolab.fr/jear/vram-calculation:v0.3-dev .
 docker push harbor.datasvc01.lysdemolab.fr/jear/vram-calculation:v0.3-dev
 
